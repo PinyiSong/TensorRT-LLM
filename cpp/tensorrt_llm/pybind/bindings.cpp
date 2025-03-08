@@ -26,11 +26,11 @@
 #include "tensorrt_llm/batch_manager/BatchManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheConfig.h"
 #include "tensorrt_llm/batch_manager/trtGptModelOptionalParams.h"
-#include "tensorrt_llm/common/mpiUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/pybind/batch_manager/algorithms.h"
 #include "tensorrt_llm/pybind/batch_manager/bindings.h"
 #include "tensorrt_llm/pybind/batch_manager/buffers.h"
+#include "tensorrt_llm/pybind/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/pybind/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/pybind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/pybind/executor/bindings.h"
@@ -42,6 +42,7 @@
 #include "tensorrt_llm/runtime/ipcUtils.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 namespace py = pybind11;
 namespace tb = tensorrt_llm::batch_manager;
@@ -84,6 +85,8 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
                 return session.tensorrt_llm::mpi::MpiComm::getSize();
             })
         .def_static("local_init", []() { tensorrt_llm::mpi::MpiComm::localSession(); })
+        .def_static("set_raw_mpi_session_by_fortran_handle",
+            [](int64_t fortran_handle) { tensorrt_llm::mpi::MpiComm::setRawSessionByFortran(fortran_handle); })
         .def_static("split",
             [](size_t color, size_t rank)
             {
@@ -93,7 +96,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 
     // Create submodule for executor bindings.
     py::module_ executor_submodule = m.def_submodule("executor", "Executor bindings");
-    tensorrt_llm::pybind::executor::InitBindings(executor_submodule);
+    tensorrt_llm::pybind::executor::initBindings(executor_submodule);
 
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = py::int_(ENABLE_MULTI_DEVICE);
@@ -203,7 +206,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
             py::arg("quantize_activations") = false, py::arg("per_token") = false, py::arg("per_channel") = false,
             py::arg("per_group") = false, py::arg("use_int4_weights") = false, py::arg("use_int8_kv_cache") = false,
             py::arg("use_fp8_kv_kache") = false, py::arg("use_fp8_qdq") = false, py::arg("use_fp8_rowwise") = false,
-            py::arg("use_w4a8_qserve") = false, py::arg("use_nvfp4") = false)
+            py::arg("use_w4a8_qserve") = false, py::arg("use_nvfp4") = false, py::arg("use_fp8_block_scales") = false)
         .def_static("use_smooth_quant", &tc::QuantMode::useSmoothQuant, py::arg("per_token") = false,
             py::arg("per_channel") = false)
         .def_static("use_weight_only", &tc::QuantMode::useWeightOnly, py::arg("use_int4_weights") = false,
@@ -270,10 +273,10 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
 
     py::class_<tr::WorldConfig>(m, "WorldConfig")
         .def(py::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
-                 std::optional<std::vector<SizeType32>> const&>(),
+                 std::optional<std::vector<SizeType32>> const&, bool>(),
             py::arg("tensor_parallelism") = 1, py::arg("pipeline_parallelism") = 1, py::arg("context_parallelism") = 1,
             py::arg("rank") = 0, py::arg("gpus_per_node") = tr::WorldConfig::kDefaultGpusPerNode,
-            py::arg("device_ids") = py::none())
+            py::arg("device_ids") = py::none(), py::arg("enable_attention_dp") = false)
         .def_property_readonly("size", &tr::WorldConfig::getSize)
         .def_property_readonly("tensor_parallelism", &tr::WorldConfig::getTensorParallelism)
         .def_property_readonly("pipeline_parallelism", &tr::WorldConfig::getPipelineParallelism)
@@ -290,12 +293,13 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("pipeline_parallel_rank", &tr::WorldConfig::getPipelineParallelRank)
         .def_property_readonly("tensor_parallel_rank", &tr::WorldConfig::getTensorParallelRank)
         .def_property_readonly("context_parallel_rank", &tr::WorldConfig::getContextParallelRank)
+        .def_property_readonly("enable_attention_dp", &tr::WorldConfig::enableAttentionDP)
         .def_static("mpi",
             py::overload_cast<SizeType32, std::optional<SizeType32>, std::optional<SizeType32>,
-                std::optional<SizeType32>, std::optional<std::vector<SizeType32>> const&>(&tr::WorldConfig::mpi),
+                std::optional<SizeType32>, std::optional<std::vector<SizeType32>> const&, bool>(&tr::WorldConfig::mpi),
             py::arg("gpus_per_node") = tr::WorldConfig::kDefaultGpusPerNode, py::arg("tensor_parallelism") = py::none(),
             py::arg("pipeline_parallelism") = py::none(), py::arg("context_parallelism") = py::none(),
-            py::arg("device_ids") = py::none());
+            py::arg("device_ids") = py::none(), py::arg("enable_attention_dp") = false);
 
     auto SamplingConfigGetState = [](tr::SamplingConfig const& config) -> py::tuple
     {
@@ -389,7 +393,12 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .value("CONTEXT_INIT", tb::LlmRequestState::kCONTEXT_INIT)
         .value("GENERATION_IN_PROGRESS", tb::LlmRequestState::kGENERATION_IN_PROGRESS)
         .value("GENERATION_TO_COMPLETE", tb::LlmRequestState::kGENERATION_TO_COMPLETE)
-        .value("GENERATION_COMPLETE", tb::LlmRequestState::kGENERATION_COMPLETE);
+        .value("GENERATION_COMPLETE", tb::LlmRequestState::kGENERATION_COMPLETE)
+        .value("DISAGG_GENERATION_INIT", tb::LlmRequestState::kDISAGG_GENERATION_INIT)
+        .value("DISAGG_CONTEXT_TRANS_IN_PROGRESS", tb::LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS)
+        .value("DISAGG_CONTEXT_COMPLETE", tb::LlmRequestState::kDISAGG_CONTEXT_COMPLETE)
+        .value("DISAGG_GENERATION_TRANS_IN_PROGRESS", tb::LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS)
+        .value("DISAGG_CONTEXT_INIT_ANS_TRANS", tb::LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
 
     py::enum_<tb::TrtGptModelType>(m, "TrtGptModelType")
         .value("V1", tb::TrtGptModelType::V1)
@@ -446,6 +455,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     tpb::initBindings(mInternalBatchManager);
     tb::kv_cache_manager::KVCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::BasePeftCacheManagerBindings::initBindings(mInternalBatchManager);
+    tb::CacheTransceiverBindings::initBindings(mInternalBatchManager);
     tpb::Buffers::initBindings(mInternalBatchManager);
 
     auto mInternalAlgorithms = mInternal.def_submodule("algorithms", "Algorithms internal bindings");
@@ -459,7 +469,9 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def(py::init<>())
         .def_readwrite("uc_ptr", &tr::IpcNvlsHandle::uc_ptr)
         .def_readwrite("mc_ptr", &tr::IpcNvlsHandle::mc_ptr)
-        .def_readwrite("size", &tr::IpcNvlsHandle::size);
+        .def_readwrite("size", &tr::IpcNvlsHandle::size)
+        .def("get_ipc_ptrs",
+            [](tr::IpcNvlsHandle& self) { return reinterpret_cast<uintptr_t>(self.ipc_uc_ptrs.data()); });
 
     m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate);
     m.def("ipc_nvls_free", &tr::ipcNvlsFree);

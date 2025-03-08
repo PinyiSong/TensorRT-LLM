@@ -278,9 +278,11 @@ protected:
 
     bool mUseBias = true;
     bool mUseLora = false;
+    bool mUsePrequantScale = false;
 
     bool mIsGated = false;
     int64_t mGatedMultiplier = 1;
+    int64_t mGroupSize = -1;
 
     tensorrt_llm::ActivationType mActType = tensorrt_llm::ActivationType::Relu;
     MOEExpertScaleNormalizationMode mNormMode = MOEExpertScaleNormalizationMode::NONE;
@@ -329,12 +331,14 @@ protected:
         // Calculate the size contributions for all the large buffers to check if the GPU has enough space
         bool const is_gated = tensorrt_llm::isGatedActivation(mActType);
         size_t const num_gemms = 2 + is_gated;
+        bool const useDeepseek = false;
+
         // Expert weights
         size_t const weight_size
             = hidden_size * (hidden_size * 4) * num_experts * sizeof(WeightStorage) * num_gemms / WEIGHT_ELEM_PER_BYTE;
         // Workspace size
-        size_t const workspace_size = this->mMoERunner.getWorkspaceSize(
-            num_tokens, hidden_size, hidden_size * 4, num_experts, k, this->mActType, mNormMode, {}, mUseLora);
+        size_t const workspace_size = this->mMoERunner.getWorkspaceSize(num_tokens, hidden_size, hidden_size * 4,
+            num_experts, k, this->mActType, mNormMode, {}, mUseLora, useDeepseek, mUsePrequantScale);
         // The input/output buffers
         size_t const in_out_size = 2 * num_tokens * hidden_size * sizeof(DataType);
 
@@ -378,8 +382,9 @@ protected:
             mTotalTokens += num_tokens;
         }
 
-        size_t workspace_size = mMoERunner.getWorkspaceSize(
-            mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK, mActType, mNormMode, parallelism_config, mUseLora);
+        bool const useDeepseek = false;
+        size_t workspace_size = mMoERunner.getWorkspaceSize(mTotalTokens, mHiddenSize, mInterSize, mNumExperts, mK,
+            mActType, mNormMode, parallelism_config, mUseLora, useDeepseek, mUsePrequantScale);
 
         auto const stream = mStream->get();
 
@@ -988,11 +993,13 @@ protected:
         }
 
         LoraParams lora_params;
+        bool const useFp8BlockScales = false;
+
         mMoERunner.setTactic(tactic1, tactic2);
         mMoERunner.runMoe(mInputTensor, mInputProbabilities, weight1_ptr, bias1_ptr, mActType, weight2_ptr, bias2_ptr,
             quant_params, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK,
             mWorkspace, mFinalOutput, mFinished, mActiveRows, mScaleProbs, mSourceToExpandedMap, mSelectedExpert,
-            mSparseMixerEpsilon, parallelism_config, mNormMode, mUseLora, lora_params, stream);
+            mSparseMixerEpsilon, parallelism_config, mNormMode, mUseLora, lora_params, useFp8BlockScales, stream);
 
         check_cuda_error(cudaStreamSynchronize(stream));
     }
@@ -2091,8 +2098,8 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
         for (int ep : {1, 4, 8})
         {
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
-                nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, {}, false, mUseLora,
-                MOEParallelismConfig{1, 0, ep, ep - 1});
+                nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, mGroupSize, {}, false,
+                mUseLora, MOEParallelismConfig{1, 0, ep, ep - 1});
 
             auto ws_size = backend.getWorkspaceSize(num_tokens);
             auto workspace = this->allocBuffer<char>(ws_size);

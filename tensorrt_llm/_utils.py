@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 from cuda import cuda
+from mpi4py import MPI
 from packaging import version
 
 # isort: off
@@ -388,7 +389,7 @@ _torch_dtype_to_np_typestr_dict = {
     torch.int64: "<i8",
     torch.int32: "<i4",
     torch.int8: "|i1",
-    torch.float8_e4m3fn: "<f1",
+    torch.float8_e4m3fn: "|i1",
     torch.qint8: "|u1",
     torch.bool: "|b1",
     torch.bfloat16: "<f2",
@@ -438,14 +439,28 @@ def dim_resolve_negative(dim, ndim):
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
 
+comm = MPI.COMM_WORLD
+
+
+def set_mpi_comm(new_comm):
+    global comm
+    comm = new_comm
+
 
 def mpi_comm():
-    from mpi4py import MPI
-    return MPI.COMM_WORLD
+    return comm
 
 
 def mpi_rank():
     return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
+
+
+def global_mpi_rank():
+    return MPI.COMM_WORLD.Get_rank() if ENABLE_MULTI_DEVICE else 0
+
+
+def global_mpi_size():
+    return MPI.COMM_WORLD.Get_size() if ENABLE_MULTI_DEVICE else 1
 
 
 def mpi_world_size():
@@ -459,6 +474,10 @@ def mpi_barrier():
 
 def mpi_broadcast(obj, root=0):
     return mpi_comm().bcast(obj, root) if ENABLE_MULTI_DEVICE else obj
+
+
+def mpi_allgather(obj):
+    return mpi_comm().allgather(obj) if ENABLE_MULTI_DEVICE else obj
 
 
 def pad_vocab_size(vocab_size, tp_size):
@@ -728,4 +747,10 @@ def convert_to_torch_tensor(
     if isinstance(tensor, torch.Tensor):
         return tensor
 
-    return torch.as_tensor(tensor).view(tensor.dtype)
+    old_ptr = tensor.data_ptr()
+    new_tensor = torch.as_tensor(tensor).view(tensor.dtype)
+    new_ptr = new_tensor.data_ptr()
+    if old_ptr != new_ptr:
+        raise RuntimeError(
+            "Data pointer mismatch after converting to torch.Tensor")
+    return new_tensor

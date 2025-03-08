@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -452,6 +452,18 @@ class Tensor(object):
         '''
         return sqrt(self)
 
+    def squeeze(self, dim, zero_is_placeholder):
+        '''
+        See functional.squeeze.
+        '''
+        return squeeze(self, dim, zero_is_placeholder)
+
+    def unsqueeze(self, dim):
+        '''
+        See functional.squeeze.
+        '''
+        return unsqueeze(self, dim)
+
     def log(self):
         '''
         See functional.log.
@@ -725,6 +737,15 @@ class MLPType(IntEnum):
     MLP = 0
     GatedMLP = 1
     FusedGatedMLP = 2
+
+
+class SliceInputType(IntEnum):
+    data = 0
+    start = 1
+    size = 2
+    stride = 3
+    fill_value = 4
+    axes = 5
 
 
 def activation(input: Tensor, act_type: trt.ActivationType) -> Tensor:
@@ -1285,6 +1306,80 @@ def slice(input: Tensor,
         layer.set_input(4, fill_value.trt_tensor)
 
     return _create_tensor(layer.get_output(0), layer)
+
+
+def pad(input: Tensor,
+        pad: Union[Sequence[int], Tensor],
+        mode: str = 'constant',
+        value: Optional[float] = None) -> Tensor:
+    '''
+    Add a pad layer.
+
+    The padding layer adds zero-padding at the start and end of the input tensor. And the
+    padding size by which to pad some dimensions of input are described starting from the
+    last dimension and moving forward.
+
+    `[len(pad) / 2]` dimensions of input will be padded. For example, to pad only the last
+    dimension of the input tensor, then pad has the form [padding_left, padding_right]; to
+    pad the last 2 dimensions of the input tensor, then use [padding_left, padding_right,
+    padding_top, padding_bottom]; to pad the last 3 dimensions, use [padding_left,
+    padding_right, padding_top, padding_bottom, padding_front, padding_back].
+
+    Parameters:
+        input : Tensor
+            The input tensor on which the padding_2d is performed.
+        pad : sequence of int
+            An m-elements tuple for padding, where its length m meets the requirement that
+            m <= 2*input dimensions, and m is even.
+        mode : str
+            Only \'constant\' is supported.
+        value : float
+            Fill value for 'constant' padding. Default: 0.
+
+    Returns:
+        The tensor produced by the inserted layer.
+    '''
+    assert mode == "constant", "Only `'constant'` is supported now."
+
+    if isinstance(pad, list) or isinstance(pad, tuple):
+        assert (
+            len(pad) % 2 == 0 and len(pad) <= 2 * input.ndim()
+        ), "The length of `pad` should be even and less than 2*input.ndim"
+        pad = constant(np.array(pad).astype(np.int32)).view([-1, 2])
+    elif isinstance(pad, Tensor):
+        pad = pad.flatten()
+        assert (
+            pad.size(0) % 2 == 0 and pad.size(0) <= 2 * input.ndim()
+        ), "The length of `pad` should be even and less than 2*input.ndim"
+        pad = pad.cast("int32").view([-1, 2])
+    else:
+        raise NotImplementedError(f"pad type {type(pad)} not supported")
+    if value is None:
+        value = 0
+
+    pad = concat([constant(np.zeros((1, 2), dtype=np.int32)),
+                  pad])  # pre-padding the indices
+    padding_index = [0] * input.ndim()
+    padding_index[-(pad.size(0) - 1):] = list(range(pad.size(0) - 1, 0,
+                                                    -1))  # reverse the indices
+    pad = index_select(pad,
+                       dim=0,
+                       index=constant(np.array(padding_index, dtype=np.int32)))
+    pre_padding, post_padding = chunk(pad, chunks=2, dim=1)
+    start = (pre_padding.flatten() * (-1)).cast('int32')
+    extend_size = (pre_padding + post_padding).flatten()
+    size = (extend_size + shape(input)).cast('int32')
+    layer = default_trtnet().add_slice(input.trt_tensor,
+                                       start=[0] * input.ndim(),
+                                       shape=[0] * input.ndim(),
+                                       stride=[1] * input.ndim())
+    layer.mode = trt.SampleMode.FILL
+    layer.set_input(SliceInputType.start, start.trt_tensor)
+    layer.set_input(SliceInputType.size, size.trt_tensor)
+    layer.set_input(SliceInputType.fill_value,
+                    constant_to_tensor_(value, dtype=input.dtype).trt_tensor)
+    output = _create_tensor(layer.get_output(0), layer)
+    return output
 
 
 def rand(shape: Tensor,
@@ -2429,7 +2524,7 @@ def masked_scatter(input: Tensor, mask: Tensor, source: Tensor) -> Tensor:
     '''
     Add the masked_scatter base on PyTorch definition.
 
-    See https://pytorch.org/docs/stable/generated/torch.Tensor.masked_scatter_.html#torch.Tensor.masked_scatter_ for a
+    See https://pytorch.org/docs/stable/generated/torch.Tensor.masked_scatter_.html#torch-tensor-masked-scatter for a
     description of that function.
 
     Parameters:
@@ -3354,7 +3449,7 @@ def softplus(input: Tensor, beta: float, threshold: float) -> Tensor:
     '''
     Add the softplus activation base on PyTorch definition.
 
-    See https://pytorch.org/docs/stable/generated/torch.nn.functional.softplus.html for a
+    See https://pytorch.org/docs/stable/generated/torch.nn.functional.softplus.html#torch-nn-functional-softplus for a
     description of that function.
 
     Parameters:
@@ -3753,7 +3848,8 @@ class AllReduceParams():
                  norm_weight: Optional[Tensor] = None,
                  scale: Optional[Tensor] = None,
                  norm_pre_residual_weight: Optional[Tensor] = None,
-                 eps: float = 1e-06):
+                 eps: float = 1e-06,
+                 enable_allreduce: bool = True):
         self.strategy = strategy
         self.config = config
         self.fusion_op = fusion_op
@@ -3763,6 +3859,8 @@ class AllReduceParams():
         self.scale = scale
         self.norm_pre_residual_weight = norm_pre_residual_weight
         self.eps = eps
+        # For torch path only, has no effect on TRT path
+        self.enable_allreduce = enable_allreduce
         assert fusion_op == AllReduceFusionOp.NONE or (residual is not None)
 
     def has_affine(self):
@@ -4148,9 +4246,11 @@ def gemm_allreduce(a: Tensor,
                    group: List[int],
                    transa: bool = False,
                    transb: bool = False,
-                   alpha: Optional[np.ndarray] = None,
+                   alpha: Optional[Union[np.ndarray, Tensor]] = None,
                    output_dtype: Optional[trt.DataType] = None,
-                   fp8_inputs_override: bool = False):
+                   fp8_inputs_override: bool = False,
+                   a_sf: Optional[Tensor] = None,
+                   b_sf: Optional[Tensor] = None):
     '''
     Add an operation that performs fused GEMM+AllReduce.
 
@@ -4159,6 +4259,10 @@ def gemm_allreduce(a: Tensor,
             Input tensor A
         b: Tensor
             Input tensor B
+        a_sf: Optional[Tensor]
+            Input tensor for scaling input A
+        b_sf: Optional[Tensor]
+            Input tensor for scaling input B
         group: List[int]
             Ranks participating in collective
         transa: bool
@@ -4179,7 +4283,7 @@ def gemm_allreduce(a: Tensor,
         Returns GEMM output tensor which has been reduced across ranks.
     '''
 
-    # Output tensor needs to be bound to externally mananged
+    # Output tensor needs to be bound to externally managed
     # memory so keep track of layer index so we can assign
     # output tensor unique label.
     if not hasattr(gemm_allreduce, 'layer_idx'):
@@ -4200,9 +4304,13 @@ def gemm_allreduce(a: Tensor,
     if output_dtype == None:
         output_dtype = str_dtype_to_trt(
             default_net().plugin_config.gemm_allreduce_plugin)
-    assert output_dtype in [trt.float16, trt.bfloat16
-                            ]  # TODO(xsimmons): expand support for other types
-    alpha = alpha if alpha else np.array(1.0, dtype=np.float32)
+    assert output_dtype in [trt.float16, trt.bfloat16]
+
+    alpha_is_tensor = isinstance(alpha, Tensor)
+    if alpha is None or alpha_is_tensor:
+        alpha_value = np.array(1.0, dtype=np.float32)
+    else:
+        alpha_value = alpha
 
     plugin_creator = trt.get_plugin_registry().get_plugin_creator(
         'GemmAllReduce', '1', TRT_LLM_PLUGIN_NAMESPACE)
@@ -4212,33 +4320,52 @@ def gemm_allreduce(a: Tensor,
     trt_type_b = trt.fp8 if fp8_inputs_override else b.dtype
 
     # create plugin fields
-    field_type_a = trt.PluginField('type_a',
-                                   np.array([int(trt_type_a)], np.int32),
-                                   trt.PluginFieldType.INT32)
-    field_type_b = trt.PluginField('type_b',
-                                   np.array([int(trt_type_b)], np.int32),
-                                   trt.PluginFieldType.INT32)
-    field_type_d = trt.PluginField('type_d',
-                                   np.array([int(output_dtype)], np.int32),
-                                   trt.PluginFieldType.INT32)
-    field_transa = trt.PluginField('transa', np.array(transa, dtype=np.int32),
-                                   trt.PluginFieldType.INT32)
-    field_transb = trt.PluginField('transb', np.array(transb, dtype=np.int32),
-                                   trt.PluginFieldType.INT32)
-    field_alpha = trt.PluginField('alpha', alpha.flatten(),
-                                  trt.PluginFieldType.FLOAT32)
-    field_group = trt.PluginField('group', np.array(group, dtype=np.int32),
-                                  trt.PluginFieldType.INT32)
+    field_list = []
+    field_list.append(
+        trt.PluginField('type_a', np.array([int(trt_type_a)], np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('type_b', np.array([int(trt_type_b)], np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('type_d', np.array([int(output_dtype)], np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('transa', np.array(transa, dtype=np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('transb', np.array(transb, dtype=np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('group', np.array(group, dtype=np.int32),
+                        trt.PluginFieldType.INT32))
+    field_list.append(
+        trt.PluginField('has_sfa', np.array([int(a_sf is not None)], np.int8),
+                        trt.PluginFieldType.INT8))
+    field_list.append(
+        trt.PluginField('has_sfb', np.array([int(b_sf is not None)], np.int8),
+                        trt.PluginFieldType.INT8))
+    field_list.append(
+        trt.PluginField('alpha_is_ptr', np.array([int(alpha_is_tensor)],
+                                                 np.int8),
+                        trt.PluginFieldType.INT8))
+    field_list.append(
+        trt.PluginField('alpha', alpha_value.flatten(),
+                        trt.PluginFieldType.FLOAT32))
 
     # create plugin
-    fields = trt.PluginFieldCollection([
-        field_type_a, field_type_b, field_type_d, field_transa, field_transb,
-        field_alpha, field_group
-    ])
+    fields = trt.PluginFieldCollection(field_list)
     plugin = plugin_creator.create_plugin("gemm_allreduce", fields)
     # define symbolic input tensors.
     # note this does NOT allocate memory.
     inputs = [a.trt_tensor, b.trt_tensor]
+    if a_sf is not None:
+        inputs += [a_sf.trt_tensor]
+    if b_sf is not None:
+        inputs += [b_sf.trt_tensor]
+    if alpha_is_tensor:
+        inputs += [alpha.trt_tensor]
+
     layer = default_trtnet().add_plugin_v2(inputs, plugin)
     _add_plugin_info(layer, plugin_creator, "gemm_allreduce", fields)
     # define symbolic output tensors
@@ -4246,12 +4373,15 @@ def gemm_allreduce(a: Tensor,
     # one has unicast address and other has multicast address
     uc_output = _create_tensor(layer.get_output(0), layer)
     mc_output = _create_tensor(layer.get_output(1), layer)
+    ipc_output = _create_tensor(layer.get_output(2), layer)
     assert uc_output is not None
     assert mc_output is not None
+    assert ipc_output is not None
     # mark outputs so that we can bind our own allocated memory in runtime
     # (see generation.py)
     uc_output.mark_output(f'gemm_allreduce_uc_out_{gemm_allreduce.layer_idx}')
     mc_output.mark_output(f'gemm_allreduce_mc_out_{gemm_allreduce.layer_idx}')
+    ipc_output.mark_output(f'gemm_allreduce_ipc_out_{gemm_allreduce.layer_idx}')
     gemm_allreduce.layer_idx += 1
 
     return uc_output
@@ -4265,7 +4395,11 @@ def bert_attention(tensor: Tensor,
                    relative_attention: bool = False,
                    relative_attention_bias: Tensor = None,
                    max_distance: int = 0,
-                   max_input_length: Tensor = None) -> Tuple[Tensor]:
+                   max_input_length: Tensor = None,
+                   sage_attn: bool = False,
+                   sage_attn_q_block_size: int = 0,
+                   sage_attn_k_block_size: int = 0,
+                   sage_attn_v_block_size: int = 0) -> Tuple[Tensor]:
     '''
     Add an operation that performs the multi-head attention in BERT.
 
@@ -4319,6 +4453,19 @@ def bert_attention(tensor: Tensor,
         max_input_length: Tensor = None
             The maximum input sequence length represented by Tensor shape. Requires for remove_input_padding to pre-define plugin workspace size.
 
+        sage_attn: bool = False
+            SageAttention is a 8-bit implementation of attention kernel. It's input q, k, v and output datatypes are 16-bit. It performance dynamic quantization for q, k, v
+            tensor every time before attention. https://github.com/thu-ml/SageAttention
+
+        sage_attn_q_quant_size: int = 0
+            dynamic quant block size along sequence dimension of q tensor. Each quant block will share one scale.
+
+        sage_attn_k_quant_size: int = 0
+            dynamic quant block size along sequence dimension of k tensor. Each quant block will share one scale.
+
+        sage_attn_v_quant_size: int = 0
+            dynamic quant block size along sequence dimension of v tensor. Each quant block will share one scale.
+
     Returns:
         The tensor produced by that layer.
     '''
@@ -4353,9 +4500,30 @@ def bert_attention(tensor: Tensor,
         "remove_padding",
         np.array(np.int8(default_net().plugin_config.remove_input_padding),
                  dtype=np.int8), trt.PluginFieldType.INT8)
+
+    sage_attn = trt.PluginField("sage_attn",
+                                np.array(np.int8(sage_attn), dtype=np.int8),
+                                trt.PluginFieldType.INT8)
+
+    sage_attn_q_block_size = trt.PluginField(
+        "sage_attn_q_block_size",
+        np.array(sage_attn_q_block_size, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
+    sage_attn_k_block_size = trt.PluginField(
+        "sage_attn_k_block_size",
+        np.array(sage_attn_k_block_size, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
+    sage_attn_v_block_size = trt.PluginField(
+        "sage_attn_v_block_size",
+        np.array(sage_attn_v_block_size, dtype=np.int32),
+        trt.PluginFieldType.INT32)
+
     pfc = trt.PluginFieldCollection([
         nheads, head_size, q_scaling, context_fmha_type, pf_type,
-        do_relative_attention, max_distance, remove_padding
+        do_relative_attention, max_distance, remove_padding, sage_attn,
+        sage_attn_q_block_size, sage_attn_k_block_size, sage_attn_v_block_size
     ])
 
     attn_plug = attn_plg_creator.create_plugin("padding_attn", pfc)
@@ -4963,16 +5131,15 @@ def gpt_attention(
     mrope_position_deltas: Tensor = None,
     host_runtime_perf_knobs: Optional[Tensor] = None,
     host_context_progress: Tensor = None,
-    layer_idx_in_cache_pool: Optional[int] = None,
     is_mla_enabled_flag: bool = False,
     q_lora_rank: int = 0,
     kv_lora_rank: int = 0,
     qk_nope_head_dim: int = 0,
     qk_rope_head_dim: int = 0,
     v_head_dim: int = 0,
-    fused_q_proj: Optional[Tensor] = None,
     q_b_proj: Optional[Tensor] = None,
     kv_b_proj: Optional[Tensor] = None,
+    k_b_proj_trans: Optional[Tensor] = None,
     skip_attn=None,
     cp_group: List[int] = [0],
     cp_size: int = 1,
@@ -5161,7 +5328,7 @@ def gpt_attention(
             See KV cache section in docs/source/advanced/gpt-attention.md, on gpu,
 
         host_kv_cache_pool_mapping:
-            The tensor of pool mapping for the different memory pools. Its shape is [num_layers,],
+            The tensor of pool mapping for the different memory pools. Its shape is [num_layers,2] - for each layer, the index of the pool, and the index of the layer within the pool,
 
         do_cross_attention: bool = False
             Do we use this as cross attention instead of self attention,
@@ -5255,9 +5422,6 @@ def gpt_attention(
     assert host_max_attention_window_sizes is not None
     assert host_sink_token_length is not None
 
-    if layer_idx_in_cache_pool is None:
-        layer_idx_in_cache_pool = layer_idx
-
     paged_kv_cache_flag = default_net().plugin_config.paged_kv_cache
     if isinstance(qkv, list):
         is_unfuse_qkv_gemm = 1
@@ -5290,10 +5454,6 @@ def gpt_attention(
     num_kv_heads = trt.PluginField("num_kv_heads",
                                    np.array(num_kv_heads, dtype=np.int32),
                                    trt.PluginFieldType.INT32)
-    layer_idx_in_cache_pool = trt.PluginField(
-        "layer_idx_in_cache_pool",
-        np.array(layer_idx_in_cache_pool, dtype=np.int32),
-        trt.PluginFieldType.INT32)
     head_size = trt.PluginField("head_size",
                                 np.array(hidden_size_per_head, dtype=np.int32),
                                 trt.PluginFieldType.INT32)
@@ -5485,10 +5645,9 @@ def gpt_attention(
         trt.PluginFieldType.INT8)
 
     pfc = trt.PluginFieldCollection([
-        layer_idx, nheads, vision_start, vision_length, num_kv_heads,
-        layer_idx_in_cache_pool, head_size, unidirectional, q_scaling,
-        attn_logit_softcapping_scale, position_embedding_type,
-        rotary_embedding_dim, rotary_embedding_base,
+        layer_idx, nheads, vision_start, vision_length, num_kv_heads, head_size,
+        unidirectional, q_scaling, attn_logit_softcapping_scale,
+        position_embedding_type, rotary_embedding_dim, rotary_embedding_base,
         rotary_embedding_scale_type, rotary_embedding_scale,
         rotary_embedding_short_m_scale, rotary_embedding_long_m_scale,
         rotary_embedding_max_positions, rotary_embedding_original_max_positions,
@@ -5605,10 +5764,10 @@ def gpt_attention(
         plug_inputs += [host_context_progress]
 
     if is_mla_enabled_flag:
-        assert fused_q_proj is not None
         assert q_b_proj is not None
         assert kv_b_proj is not None
-        plug_inputs += [fused_q_proj, q_b_proj, kv_b_proj]
+        assert k_b_proj_trans is not None
+        plug_inputs += [q_b_proj, kv_b_proj, k_b_proj_trans]
 
     if skip_attn is not None:
         plug_inputs += [skip_attn]
@@ -5800,6 +5959,26 @@ def rms_norm(input: Tensor,
     return y
 
 
+def repeat(input: Tensor, sizes: Sequence[int]) -> Tensor:
+    '''
+    Repeats the tensor along the specified dimensions.
+
+    Parameters:
+        input : Tensor
+            The tensor to be repeated.
+        sizes : Sequence[int]
+            The number of times to repeat the tensor along each dimension.
+
+    Returns:
+        A tensor except for repeated input tensors along specified dim.
+
+    '''
+    repeated_tensor = input
+    for k in range(-1, -len(sizes) - 1, -1):
+        repeated_tensor = concat([repeated_tensor] * sizes[k], dim=k)
+    return repeated_tensor
+
+
 def repeat_interleave(tensor: Tensor, repeats: int, dim: int) -> Tensor:
     '''
     Repeats elements of a tensor along an axis.
@@ -5825,6 +6004,32 @@ def repeat_interleave(tensor: Tensor, repeats: int, dim: int) -> Tensor:
     tile_reshape_size[dim] = tile_reshape_size[dim] * repeats
     tensor = tile.view(concat(tile_reshape_size))
     return tensor
+
+
+def meshgrid2d(x: Tensor, y: Tensor) -> Tuple[Tensor]:
+    '''
+    Creates grids (2D) of coordinates specified by the 1D inputs (only supports `indexing=\'xy\'`).
+
+    Parameters:
+        x : Tensor
+            The first input (1D) tensor.
+        y : Tensor
+            The second input (1D) tensor.
+
+    Returns:
+        The tuple of two tensors produced.
+
+    TODO: Add full support for torch.meshgrid.
+          See https://pytorch.org/docs/stable/generated/torch.meshgrid.html#torch-meshgrid
+    '''
+    if x.ndim() == 1:
+        x = expand_dims(x, 0)
+    if y.ndim() == 1:
+        y = expand_dims(y, 0)
+    grid_x = repeat_interleave(x, shape(y, 1),
+                               1).view([x.shape[-1], y.shape[-1]])
+    grid_y = repeat(y, (x.shape[-1], 1))
+    return (grid_x, grid_y)
 
 
 def generate_logn_scaling(seq_length: int = 8192,
@@ -6062,6 +6267,7 @@ ACT2FN = {
     'squared-relu': squared_relu,
     'swiglu': swiglu,
     'fast-swiglu': swiglu,
+    'sigmoid': sigmoid,
 }
 
 GATED_ACT_2_ACT = {

@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections import namedtuple
 from typing import Optional
 
 from tensorrt_llm.bindings import executor as tb_executor
@@ -7,6 +8,11 @@ from tensorrt_llm.bindings import internal as tb_internal
 from .llm_request import LlmRequest, LlmRequestState
 
 RequestList = list[LlmRequest]
+
+SchedulerOutput = namedtuple("SchedulerOutput", [
+    "context_requests", "generation_requests", "paused_requests",
+    "fitting_disagg_gen_init_requests", "num_fitting_requests"
+])
 
 
 class ScheduledRequests:
@@ -21,6 +27,10 @@ class ScheduledRequests:
             len(req.draft_tokens) == 0 for req in self.generation_requests))
 
     @property
+    def can_run_cuda_graph(self) -> bool:
+        return (not self.context_requests)
+
+    @property
     def batch_size(self) -> int:
         return len(self.context_requests) + len(self.generation_requests)
 
@@ -28,13 +38,12 @@ class ScheduledRequests:
 class RequestScheduler(ABC):
 
     @abstractmethod
-    def schedule_request(
-        self, active_requests: RequestList, inflight_request_ids: set[int]
-    ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
+    def schedule_request(self, active_requests: RequestList,
+                         inflight_request_ids: set[int]) -> SchedulerOutput:
         """
         :param active_requests: list of active requests, up to maximum number of sequences
         :param inflight_request_ids: set of request ids that are inflight (of all micro batches)
-        :return: (contextRequests, generationRequests, pausedRequests)
+        :return: SchedulerOutput
         """
         # to be aligned with RequestScheduler::scheduleRequests in cpp/tensorrt_llm/batch_manager/requestScheduler.h
         raise NotImplementedError
@@ -45,7 +54,7 @@ class CapacityScheduler(ABC):
     @abstractmethod
     def schedule_request(
         self, active_requests: RequestList
-    ) -> tuple[list[LlmRequest], list[LlmRequest]]:
+    ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
         """
         :param active_requests: list of active requests, up to maximum number of sequences
         :return: (scheduledRequests, pausedRequests)
@@ -65,12 +74,13 @@ class BindCapacityScheduler(CapacityScheduler):
         super(BindCapacityScheduler, self).__init__()
         self.kv_cache_manager = kv_cache_manager
         self.impl = tb_internal.algorithms.CapacityScheduler(
-            max_num_requests, scheduler_policy, True, False,
-            LlmRequestState.CONTEXT_INIT, LlmRequestState.GENERATION_COMPLETE)
+            max_num_requests, scheduler_policy, kv_cache_manager is not None,
+            False, LlmRequestState.CONTEXT_INIT,
+            LlmRequestState.GENERATION_COMPLETE)
 
     def schedule_request(
         self, active_requests: RequestList
-    ) -> tuple[list[LlmRequest], list[LlmRequest]]:
+    ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
         return self.impl(active_requests, self.kv_cache_manager)
 
 
@@ -155,7 +165,8 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
         super(BindMicroBatchScheduler, self).__init__()
         self.max_batch_size = max_batch_size
         self.max_num_tokens = max_num_tokens
-        self.impl = tb_internal.algorithms.MicroBatchScheduler(ctx_chunk_config)
+        self.impl = tb_internal.algorithms.MicroBatchScheduler(
+            ctx_chunk_config, max_num_tokens)
 
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -172,12 +183,14 @@ class SimpleScheduler(RequestScheduler):
         self.capacity_scheduler = capacity_scheduler
         self.micro_batch_scheduler = micro_batch_scheduler
 
-    def schedule_request(
-        self, active_requests: RequestList, inflight_request_ids: set[int]
-    ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
-        fitting_requests, paused_requests = self.capacity_scheduler.schedule_request(
+    def schedule_request(self, active_requests: RequestList,
+                         inflight_request_ids: set[int]) -> SchedulerOutput:
+        fitting_requests, fitting_disagg_gen_init_requests, paused_requests = self.capacity_scheduler.schedule_request(
             active_requests)
-        #print(f'capacitor scheduler scheduled {len(fitting_requests)} fitting_request')
+
         context_requests, generation_requests = self.micro_batch_scheduler.schedule(
             fitting_requests, inflight_request_ids)
-        return context_requests, generation_requests, paused_requests
+        return SchedulerOutput(context_requests, generation_requests,
+                               paused_requests,
+                               fitting_disagg_gen_init_requests,
+                               len(fitting_requests))

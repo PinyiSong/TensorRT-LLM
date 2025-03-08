@@ -202,10 +202,15 @@ public:
     }
 
     std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
-        std::vector<tb::LlmRequest::RequestIdType> const& requestIds) const
+        std::vector<tb::LlmRequest::RequestIdType> const& requestIds) const override
     {
         PYBIND11_OVERLOAD_PURE(std::vector<std::vector<std::vector<SizeType32>>>, tbk::BaseKVCacheManager,
             getBatchCacheBlockIds, requestIds);
+    }
+
+    std::vector<SizeType32> getNewlyAllocatedBlockIds(tb::LlmRequest::RequestIdType requestId) const override
+    {
+        PYBIND11_OVERLOAD_PURE(std::vector<SizeType32>, tbk::BaseKVCacheManager, getNewlyAllocatedBlockIds, requestId);
     }
 
     SizeType32 getUsedNumBlocks() const override
@@ -256,6 +261,8 @@ public:
 class PyBasePeftCacheManager : public tb::BasePeftCacheManager
 {
 public:
+    ~PyBasePeftCacheManager() override = default;
+
     void addRequestPeft(tb::BasePeftCacheManager::LlmRequestPtr llmRequest, bool tryGpuCache = true) override
     {
         PYBIND11_OVERLOAD_PURE(void, tb::BasePeftCacheManager, addRequestPeft, llmRequest, tryGpuCache);
@@ -314,7 +321,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
 
     py::classh<tbk::BaseKVCacheManager, PyKvCacheManager>(m, "BaseKVCacheManager")
         .def_static("calculate_max_num_blocks", &tbk::BaseKVCacheManager::calculateMaxNumBlocks, py::arg("config"),
-            py::arg("dtype"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"))
+            py::arg("dtype"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"),
+            py::arg("kvFactor"))
         .def("allocate_pools", &BaseKVCacheManager::allocatePools)
         .def("release_pools", &BaseKVCacheManager::releasePools)
         .def("start_scheduling", &BaseKVCacheManager::startScheduling)
@@ -395,11 +403,13 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks)
         .def("scheduling_has_free_blocks", &BaseKVCacheManager::schedulingHasFreeBlocks)
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds)
-        .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds);
+        .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds)
+        .def("get_newly_allocated_block_ids", &BaseKVCacheManager::getNewlyAllocatedBlockIds);
 
     py::enum_<tbk::CacheType>(m, "CacheType")
         .value("SELF", tbk::CacheType::kSELF)
-        .value("CROSS", tbk::CacheType::kCROSS);
+        .value("CROSS", tbk::CacheType::kCROSS)
+        .value("SELFKONLY", tbk::CacheType::kSELFKONLY);
 
     py::classh<tbk::KVCacheManager, tbk::BaseKVCacheManager>(m, "KVCacheManager")
         .def(py::init<std::vector<SizeType32> const&, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
