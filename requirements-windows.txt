@@ -23,7 +23,7 @@ tokenizers>=0.14
 torch==2.4.1+cu124
 torchvision
 nvidia-modelopt[torch]~=0.17.0
-transformers>=4.38.2,<=4.45.2
+transformers>=4.38.2,<=4.53.0
 wheel
 optimum
 evaluate
