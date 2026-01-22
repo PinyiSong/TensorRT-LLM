@@ -4,7 +4,7 @@ tensorrt_llm>=0.0.0.dev0
 datasets==2.14.6
 evaluate
 rouge_score
-sentencepiece==0.2.0
+sentencepiece==0.2.1
 jax[cuda12-pip]==0.4.29
 jaxlib[cuda12-pip]==0.4.29
 dm_haiku==0.0.12
